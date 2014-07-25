@@ -312,29 +312,31 @@ dataFetchOrElse :: (DataSource u r, Request r a)
                    -- ^ an IO action that modifies the data source so that the default response is consistent with future requests
                    -> GenHaxl u a
 dataFetchOrElse req defaultAnswer pred action = GenHaxl $ \env ref -> do
-  res <- cached env req
-  case res of
-    Uncached rvar -> do
-      modifyIORef' ref $ \ bs -> addRequest (BlockedFetch req rvar) bs
-      return $ Blocked (continueFetchOrElse req rvar defaultAnswer pred action)
-    CachedNotFetched rvar ->
-      return $ Blocked (continueFetchOrElse req rvar defaultAnswer pred action)
-    Cached (Left ex) -> return (Throw ex)
-    Cached (Right a) -> return (Done a)
+  rvar <- newEmptyResult
+  modifyIORef' ref $ \ bs -> addRequest (BlockedFetch req rvar) bs
+  return $ Blocked (continueFetchOrElse req rvar defaultAnswer pred action)
 
 continueFetchOrElse :: (DataSource u r, Request r a, Show a)
                        => r a -> ResultVar a -> a -> (a -> Bool) -> IO () -> GenHaxl u a
-continueFetchOrElse req rvar defaultAnswer pred action = GenHaxl $ \_env _ref -> do
+continueFetchOrElse req rvar defaultAnswer pred action = GenHaxl $ \env _ref -> do
   m <- tryReadResult rvar
   case m of
     Nothing -> raise . DataSourceError $
       textShow req <> " did not set contents of result var"
     Just (Left ex) -> return (Throw ex)
-    Just (Right r) -> case pred r of
-      True -> return (Done r)
-      False -> do
-        action
-        return . Done $ defaultAnswer
+    Just (Right r) -> do
+      result <- if pred r
+                then return r
+                else do
+                  action
+                  return defaultAnswer
+      cachedResult <- cached env req
+      case cachedResult of
+        Uncached rvar -> do
+          putResult rvar (Right result)
+          return ()
+        _ -> return ()
+      return (Done result)
 
 -- | Performs actual fetching of data for a 'Request' from a 'DataSource'.
 dataFetch :: (DataSource u r, Request r a) => r a -> GenHaxl u a
