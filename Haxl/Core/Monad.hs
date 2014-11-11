@@ -30,6 +30,7 @@ module Haxl.Core.Monad (
 
     -- * Data fetching and caching
     dataFetch, uncachedRequest,
+    dataFetchEquiv,
     cacheRequest, cacheResult, cachedComputation,
     dumpCacheAsHaskell,
 
@@ -72,6 +73,7 @@ import Control.Arrow (left)
 import Control.Exception (bracket_)
 import Debug.Trace (traceEventIO)
 #endif
+import Unsafe.Coerce
 
 -- -----------------------------------------------------------------------------
 -- The environment
@@ -344,6 +346,28 @@ dataFetch req = GenHaxl $ \env ref -> do
     -- Cached: either a result, or an exception
     Cached (Left ex) -> return (Throw ex)
     Cached (Right a) -> return (Done a)
+
+-- | Allows building equivalence classes of requests, so that at most
+-- one request will be preformed in the same round for each
+-- equivalence class.
+--
+-- Given an equivalence relation and a request @req@, the currently
+-- blocked requests will be checked for an eqivalent request @req'@.
+-- If found, the request will be replaced by @req'@.
+dataFetchEquiv :: forall r a u . (DataSource u r, Request r a)
+                  => (r a -> r a -> Bool) -- ^ Equivalence relation
+                  -> r a
+                  -> GenHaxl u a
+dataFetchEquiv equiv req = do
+  allRequests <- GenHaxl $ \ _ ref -> readIORef ref >>= \ x -> return (Done x)
+  let test (BlockedFetch r _) = unsafeCoerce r `equiv` req
+  let req' = find test (requestsOfType req allRequests) -- Map.lookup ty allRequests
+  case req' of
+    Nothing -> dataFetch req
+    Just (BlockedFetch r rvar) ->
+      let r' = unsafeCoerce r :: r a
+          rvar' = unsafeCoerce rvar
+      in GenHaxl $ \ _ _ -> return $ Blocked (continueFetch r' rvar' :: GenHaxl u a)
 
 -- | A data request that is not cached.  This is not what you want for
 -- normal read requests, because then multiple identical requests may
