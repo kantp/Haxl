@@ -326,6 +326,23 @@ cached env req = do
             Right _ -> "Cached request: " ++ show req
           return (Cached r)
 
+-- | Use not the request itself, but the image of the request under a
+-- mapping as a key in the cache.
+--
+-- This can be used to collect different requests that are known
+-- priori to give the same results and only perform one request, as in
+-- 'dataFetchEquiv'.
+--
+-- Another possible use case is to reduce the overall size of the
+-- cache if the requests have a large memory footprint.  In this case,
+-- @f@ could be a function that calculates a cryptographic hash of the
+-- request parameters.
+cachedKeyTransform :: (Request r a)
+                      => (r a -> r a)
+                      -- ^ Function @f@ that transforms the request.
+                      -> Env u -> r a -> IO (CacheResult a)
+cachedKeyTransform f env req = cached env (f req)
+
 -- | Performs actual fetching of data for a 'Request' from a 'DataSource'.
 dataFetch :: (DataSource u r, Request r a) => r a -> GenHaxl u a
 dataFetch req = GenHaxl $ \env ref -> do
@@ -347,27 +364,46 @@ dataFetch req = GenHaxl $ \env ref -> do
     Cached (Left ex) -> return (Throw ex)
     Cached (Right a) -> return (Done a)
 
--- | Allows building equivalence classes of requests, so that at most
--- one request will be preformed in the same round for each
+-- | Allows building equivalence classes of requests (classes of
+-- requests that are known a priori to give the same result), so that
+-- at most one request will be preformed in the same round for each
 -- equivalence class.
 --
 -- Given an equivalence relation and a request @req@, the currently
 -- blocked requests will be checked for an eqivalent request @req'@.
 -- If found, the request will be replaced by @req'@.
+--
+-- In addition to the equivalence relation, one can also provide a
+-- function that maps each request from one equivalence class to a
+-- /unique/ representative of that class.  This representative will be
+-- used as the key in the cache.  This will ensure that only one
+-- request from each class is performed ever, not only in a given
+-- round.
 dataFetchEquiv :: forall r a u . (DataSource u r, Request r a)
-                  => (r a -> r a -> Bool) -- ^ Equivalence relation
+                  => (r a -> r a -> Bool)
+                  -- ^ Equivalence relation on requests.
+                  -> (r a -> r a)
+                  -- ^ Function that selects a unique representative from a class.
                   -> r a
                   -> GenHaxl u a
-dataFetchEquiv equiv req = do
-  allRequests <- GenHaxl $ \ _ ref -> readIORef ref >>= \ x -> return (Done x)
-  let test (BlockedFetch r _) = unsafeCoerce r `equiv` req
-  let req' = find test (requestsOfType req allRequests) -- Map.lookup ty allRequests
-  case req' of
-    Nothing -> dataFetch req
-    Just (BlockedFetch r rvar) ->
-      let r' = unsafeCoerce r :: r a
-          rvar' = unsafeCoerce rvar
-      in GenHaxl $ \ _ _ -> return $ Blocked (continueFetch r' rvar' :: GenHaxl u a)
+dataFetchEquiv equiv f req = GenHaxl $ \ env ref -> do
+  res <- cachedKeyTransform f env req
+  case res of
+    Uncached rvar -> do
+      allRequests <- readIORef ref
+      let test (BlockedFetch r _) = unsafeCoerce r `equiv` req
+          req' = find test (requestsOfType req allRequests) -- Map.lookup ty allRequests
+      case req' of
+        Nothing -> do
+          modifyIORef' ref $ \ bs -> addRequest (BlockedFetch req rvar) bs
+          return $ Blocked (continueFetch req rvar)
+        Just (BlockedFetch r rvar) ->
+          let r' = unsafeCoerce r :: r a
+              rvar' = unsafeCoerce rvar
+          in return $ Blocked (continueFetch r' rvar')
+    CachedNotFetched rvar -> return $ Blocked (continueFetch req rvar)
+    Cached (Left ex) -> return (Throw ex)
+    Cached (Right a) -> return (Done a)
 
 -- | A data request that is not cached.  This is not what you want for
 -- normal read requests, because then multiple identical requests may
