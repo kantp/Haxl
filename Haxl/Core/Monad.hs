@@ -65,6 +65,7 @@ import Text.Printf
 import Text.PrettyPrint hiding ((<>))
 import Control.Arrow (left)
 import Unsafe.Coerce
+import Control.DeepSeq
 
 -- -----------------------------------------------------------------------------
 -- The environment
@@ -515,7 +516,7 @@ performFetches env reqs = do
       getReq :: [BlockedFetch r] -> r a
       getReq = undefined
 
-  modifyIORef' sref $ \(Stats rounds) ->
+  modifyIORef' sref $ \(Stats rounds) -> roundstats `deepseq`
      Stats (RoundStats (HashMap.fromList roundstats) : rounds)
 
   ifTrace f 1 $
