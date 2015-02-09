@@ -28,6 +28,7 @@ import Data.Maybe
 import Control.Applicative hiding (empty)
 import Control.Exception
 
+import qualified LRUBoundedMap_LinkedListHashMap as LRU
 import Haxl.Core.Types
 
 -- | The 'DataCache' maps things of type @f a@ to @'ResultVar' a@, for
@@ -45,7 +46,7 @@ newtype DataCache res = DataCache (HashMap TypeRep (SubCache res))
 -- 'Hashable' and 'Eq' once per request type.
 data SubCache res =
   forall req a . (Hashable (req a), Eq (req a), Show (req a), Show a) =>
-       SubCache ! (HashMap (req a) (res a))
+       SubCache ! (LRU.Map (req a) (res a))
        -- NB. the inner HashMap is strict, to avoid building up
        -- a chain of thunks during repeated insertions.
 
@@ -64,12 +65,15 @@ insert
   -> DataCache res
 
 insert req result (DataCache m) =
-      DataCache $
-        HashMap.insertWith fn (typeOf req)
-                              (SubCache (HashMap.singleton req result)) m
-  where
-    fn (SubCache new) (SubCache old) =
-        SubCache (unsafeCoerce new `HashMap.union` old)
+  case HashMap.lookup (typeOf req) m of
+  Nothing ->
+    DataCache $ HashMap.insert (typeOf req)
+    (SubCache . fst . LRU.insert req result $ LRU.empty 100)
+    m
+  Just (SubCache subCache) ->
+    DataCache $ HashMap.insert (typeOf req)
+    (SubCache . fst . LRU.insert (unsafeCoerce req) (unsafeCoerce result) $ subCache)
+    m
 
 -- | Looks up the cached result of a request.
 lookup
@@ -83,7 +87,7 @@ lookup req (DataCache m) =
       case HashMap.lookup (typeOf req) m of
         Nothing -> Nothing
         Just (SubCache sc) ->
-           unsafeCoerce (HashMap.lookup (unsafeCoerce req) sc)
+           unsafeCoerce (LRU.lookup (unsafeCoerce req) sc)
 
 -- | Dumps the contents of the cache, with requests and responses
 -- converted to 'String's using 'show'.  The entries are grouped by
@@ -99,7 +103,7 @@ showCache (DataCache cache) = mapM goSubCache (HashMap.toList cache)
     :: (TypeRep,SubCache ResultVar)
     -> IO (TypeRep,[(String, Either SomeException String)])
   goSubCache (ty, SubCache hmap) = do
-    elems <- catMaybes <$> mapM go (HashMap.toList hmap)
+    elems <- catMaybes <$> mapM go (LRU.view hmap)
     return (ty, elems)
 
   go :: (Show (req a), Show a)
